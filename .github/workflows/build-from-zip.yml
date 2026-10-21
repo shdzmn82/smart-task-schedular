@@ -1,0 +1,79 @@
+name: Build Smart Task Scheduler from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-from-zip.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and safely extract Android source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, zipfile, sys
+          root = pathlib.Path('.').resolve()
+          files = sorted(root.glob('SmartTaskScheduler*.zip'))
+          if len(files) != 1:
+              sys.exit(f'Expected exactly one SmartTaskScheduler*.zip at repository root, found {len(files)}: {[p.name for p in files]}')
+          destination = root / 'android-source'
+          destination.mkdir()
+          with zipfile.ZipFile(files[0]) as archive:
+              for entry in archive.infolist():
+                  target = (destination / entry.filename).resolve()
+                  if not target.is_relative_to(destination):
+                      sys.exit(f'Unsafe ZIP entry: {entry.filename}')
+              archive.extractall(destination)
+          candidates = list(destination.rglob('settings.gradle.kts')) + list(destination.rglob('settings.gradle'))
+          candidates = [p.parent for p in candidates if (p.parent / 'app' / 'build.gradle.kts').exists() or (p.parent / 'app' / 'build.gradle').exists()]
+          if len(candidates) != 1:
+              sys.exit(f'Expected one Android project root, found {len(candidates)}')
+          with open('project_dir.txt', 'w') as out:
+              out.write(str(candidates[0].relative_to(root)))
+          print('Project root:', candidates[0])
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$(cat "$GITHUB_WORKSPACE/project_dir.txt")"
+          gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartTaskScheduler-v1.0-debug-APK
+          path: android-source/**/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
