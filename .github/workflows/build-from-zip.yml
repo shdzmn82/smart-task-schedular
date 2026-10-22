@@ -1,5 +1,4 @@
 name: Build Smart Task Scheduler from ZIP
-
 on:
   workflow_dispatch:
   push:
@@ -7,51 +6,39 @@ on:
     paths:
       - 'SmartTaskScheduler*.zip'
       - '.github/workflows/build-from-zip.yml'
-
 permissions:
   contents: read
-
 jobs:
   build-apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Find and safely extract Android source ZIP
+      - uses: actions/checkout@v4
+      - name: Extract source ZIP safely
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import pathlib, zipfile, sys
-          root = pathlib.Path('.').resolve()
-          files = sorted(root.glob('SmartTaskScheduler*.zip'))
-          if len(files) != 1:
-              sys.exit(f'Expected exactly one SmartTaskScheduler*.zip at repository root, found {len(files)}: {[p.name for p in files]}')
-          destination = root / 'android-source'
-          destination.mkdir(exist_ok=True)
-          with zipfile.ZipFile(files[0]) as archive:
-              for entry in archive.infolist():
-                  target = (destination / entry.filename).resolve()
-                  if not target.is_relative_to(destination):
-                      sys.exit(f'Unsafe ZIP entry: {entry.filename}')
-              archive.extractall(destination)
-          candidates = list(destination.rglob('settings.gradle.kts')) + list(destination.rglob('settings.gradle'))
-          candidates = [p.parent for p in candidates if (p.parent / 'app' / 'build.gradle.kts').exists() or (p.parent / 'app' / 'build.gradle').exists()]
-          if len(candidates) != 1:
-              sys.exit(f'Expected one Android project root, found {len(candidates)}')
-          pathlib.Path('project_dir.txt').write_text(str(candidates[0].relative_to(root)))
-          print('Project root:', candidates[0])
-          PY
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+          python3 - <<'PYCODE'
+          import pathlib,zipfile,sys
+          root=pathlib.Path('.').resolve()
+          zips=sorted(root.glob('SmartTaskScheduler*.zip'))
+          if len(zips)!=1: sys.exit(f'Expected exactly one SmartTaskScheduler*.zip, found {len(zips)}')
+          dest=root/'android-source';dest.mkdir(exist_ok=True)
+          with zipfile.ZipFile(zips[0]) as z:
+              for entry in z.infolist():
+                  target=(dest/entry.filename).resolve()
+                  if not target.is_relative_to(dest):sys.exit('Unsafe ZIP path')
+                  if (entry.external_attr >> 16) & 0o170000 == 0o120000:sys.exit('Symlinks not permitted')
+              z.extractall(dest)
+          roots=[p.parent for p in list(dest.rglob('settings.gradle.kts'))+list(dest.rglob('settings.gradle')) if (p.parent/'app/build.gradle.kts').exists() or (p.parent/'app/build.gradle').exists()]
+          if len(roots)!=1:sys.exit(f'Expected exactly one Android project root, found {len(roots)}')
+          pathlib.Path('project_dir.txt').write_text(str(roots[0].relative_to(root)))
+          PYCODE
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Install SDK platform using preinstalled Android SDK
+      - name: Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
@@ -59,29 +46,53 @@ jobs:
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f | head -n 1)"
-          fi
-          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          test -x "$SDKMANAGER" || SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | head -1)"
+          test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" 'platforms;android-35' 'build-tools;35.0.0'
-
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-
-      - name: Build debug APK
+      - name: Prepare optional signing key
+        id: signing
         shell: bash
+        env:
+          STS_KEYSTORE_BASE64: ${{ secrets.STS_KEYSTORE_BASE64 }}
+          STS_KEYSTORE_PASSWORD: ${{ secrets.STS_KEYSTORE_PASSWORD }}
+          STS_KEY_ALIAS: ${{ secrets.STS_KEY_ALIAS }}
+          STS_KEY_PASSWORD: ${{ secrets.STS_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ -n "$STS_KEYSTORE_BASE64" && -n "$STS_KEYSTORE_PASSWORD" && -n "$STS_KEY_ALIAS" && -n "$STS_KEY_PASSWORD" ]]; then
+            printf '%s' "$STS_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/sts-release.jks"
+            chmod 600 "$RUNNER_TEMP/sts-release.jks"
+            echo 'signed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build stable signed release APK
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        env:
+          STS_KEYSTORE_PASSWORD: ${{ secrets.STS_KEYSTORE_PASSWORD }}
+          STS_KEY_ALIAS: ${{ secrets.STS_KEY_ALIAS }}
+          STS_KEY_PASSWORD: ${{ secrets.STS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export STS_KEYSTORE_FILE="$RUNNER_TEMP/sts-release.jks"
           cd "$(cat "$GITHUB_WORKSPACE/project_dir.txt")"
-          gradle :app:assembleDebug --no-daemon --stacktrace
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+          gradle :app:assembleRelease --no-daemon --stacktrace
+          test -s app/build/outputs/apk/release/app-release.apk
+      - name: Require stable signing configuration
+        if: steps.signing.outputs.signed != 'true'
+        shell: bash
+        run: |
+          echo 'ERROR: Stable signing secrets are missing. No debug APK generated to avoid future update conflicts.' >&2
+          echo 'Configure STS_KEYSTORE_BASE64, STS_KEYSTORE_PASSWORD, STS_KEY_ALIAS, STS_KEY_PASSWORD in repository Actions secrets.' >&2
+          exit 1
+      - uses: actions/upload-artifact@v4
         with:
-          name: SmartTaskScheduler-v1.0-debug-APK
-          path: android-source/**/app/build/outputs/apk/debug/*.apk
+          name: SmartTaskScheduler-v1.0.8-signed-APK
+          path: android-source/**/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
